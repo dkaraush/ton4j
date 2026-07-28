@@ -1,0 +1,51 @@
+apply plugin: 'java-library'
+
+repositories {
+    mavenCentral()
+}
+
+sourceSets {
+    main {
+        java {
+            srcDirs = [
+                '../utils/src/main/java',
+                '../address/src/main/java',
+                '../bitstring/src/main/java',
+                '../cell/src/main/java',
+                '../mnemonic/src/main/java',
+                '../provider/src/main/java',
+                '../tlb/src/main/java',
+                '../tl/src/main/java',
+                '../tonlib/src/main/java',
+                '../adnl/src/main/java',
+                '../toncenter/src/main/java',
+                '../fift/src/main/java',
+                '../func/src/main/java',
+                '../tolk/src/main/java',
+                '../smartcontract/src/main/java'
+            ]
+        }
+    }
+}
+
+dependencies {
+    api 'com.google.code.gson:gson:2.11.0'
+    api 'com.squareup.okhttp3:okhttp:4.12.0'
+    api 'commons-codec:commons-codec:1.15'
+    api 'commons-io:commons-io:2.18.0'
+    api 'net.lingala.zip4j:zip4j:2.11.3'
+    api 'org.apache.commons:commons-lang3:3.18.0'
+    api 'org.bouncycastle:bcprov-jdk18on:1.78.1'
+    api 'org.purejava:tweetnacl-java:1.1.2'
+    api 'org.slf4j:slf4j-api:2.0.17'
+
+    compileOnly 'net.java.dev.jna:jna:5.15.0'
+    compileOnly 'net.java.dev.jna:jna-platform:5.15.0'
+    compileOnly 'org.projectlombok:lombok:1.18.38'
+    annotationProcessor 'org.projectlombok:lombok:1.18.38'
+}
+
+java {
+    sourceCompatibility = JavaVersion.VERSION_11
+    targetCompatibility = JavaVersion.VERSION_11
+}

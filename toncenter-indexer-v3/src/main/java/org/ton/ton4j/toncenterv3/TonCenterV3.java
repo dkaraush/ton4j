@@ -32,6 +32,7 @@ public class TonCenterV3 {
   private Duration writeTimeout;
   private boolean debug;
   private boolean uniqueRequests;
+  private TonCenterV3Transport transport;
   private OkHttpClient httpClient;
   private Gson gson;
 
@@ -47,6 +48,7 @@ public class TonCenterV3 {
     private Duration writeTimeout = Duration.ofSeconds(30);
     private boolean debug;
     private boolean uniqueRequests;
+    private TonCenterV3Transport transport;
 
     public TonCenterV3Builder apiKey(String apiKey) {
       this.apiKey = apiKey;
@@ -105,6 +107,15 @@ public class TonCenterV3 {
       return this;
     }
 
+    /**
+     * Routes every Toncenter request through a protocol-neutral application transport instead of
+     * OkHttp.
+     */
+    public TonCenterV3Builder transport(TonCenterV3Transport transport) {
+      this.transport = Objects.requireNonNull(transport, "transport");
+      return this;
+    }
+
     public TonCenterV3 build() {
       if (nonNull(this.network)) {
         this.endpoint = this.network.getEndpoint();
@@ -116,6 +127,7 @@ public class TonCenterV3 {
       tonCenterV3.network = this.network;
       tonCenterV3.debug = this.debug;
       tonCenterV3.uniqueRequests = this.uniqueRequests;
+      tonCenterV3.transport = this.transport;
       tonCenterV3.connectTimeout = this.connectTimeout;
       tonCenterV3.readTimeout = this.readTimeout;
       tonCenterV3.writeTimeout = this.writeTimeout;
@@ -154,6 +166,10 @@ public class TonCenterV3 {
                     })
             .create();
 
+    if (nonNull(transport)) {
+      return;
+    }
+
     OkHttpClient.Builder clientBuilder =
         new OkHttpClient.Builder()
             .connectTimeout(connectTimeout.toMillis(), TimeUnit.MILLISECONDS)
@@ -183,46 +199,30 @@ public class TonCenterV3 {
   }
 
   private <T> T executeGet(String path, Map<String, Object> params, Type responseType) {
-    HttpUrl.Builder urlBuilder = HttpUrl.parse(endpoint + path).newBuilder();
+    Map<String, List<String>> query = toQuery(params);
 
-    if (nonNull(params)) {
-      for (Map.Entry<String, Object> entry : params.entrySet()) {
-        if (entry.getValue() instanceof List) {
-          for (Object value : (List<?>) entry.getValue()) {
-            urlBuilder.addQueryParameter(entry.getKey(), value.toString());
-          }
-        } else if (nonNull(entry.getValue())) {
-          urlBuilder.addQueryParameter(entry.getKey(), entry.getValue().toString());
-        }
-      }
+    addCommonQueryParameters(query);
+    if (nonNull(transport)) {
+      return executeTransport("GET", path, query, null, responseType);
     }
 
-    if (nonNull(apiKey) && !apiKey.trim().isEmpty()) {
-      urlBuilder.addQueryParameter("api_key", apiKey);
-    }
-
-    if (uniqueRequests) {
-      urlBuilder.addQueryParameter("t", UUID.randomUUID().toString());
-    }
-
+    HttpUrl.Builder urlBuilder = Objects.requireNonNull(HttpUrl.parse(endpoint + path)).newBuilder();
+    addQueryParameters(urlBuilder, query);
     Request request = new Request.Builder().url(urlBuilder.build()).get().build();
     return executeRequest(request, responseType);
   }
 
   private <T> T executePost(String path, Object requestBody, Type responseType) {
     String json = gson.toJson(requestBody);
+    Map<String, List<String>> query = new LinkedHashMap<>();
+    addCommonQueryParameters(query);
+    if (nonNull(transport)) {
+      return executeTransport("POST", path, query, json, responseType);
+    }
+
     RequestBody body = RequestBody.create(json, JSON);
-
-    HttpUrl.Builder urlBuilder = HttpUrl.parse(endpoint + path).newBuilder();
-
-    if (nonNull(apiKey) && !apiKey.trim().isEmpty()) {
-      urlBuilder.addQueryParameter("api_key", apiKey);
-    }
-
-    if (uniqueRequests) {
-      urlBuilder.addQueryParameter("t", UUID.randomUUID().toString());
-    }
-
+    HttpUrl.Builder urlBuilder = Objects.requireNonNull(HttpUrl.parse(endpoint + path)).newBuilder();
+    addQueryParameters(urlBuilder, query);
     Request request = new Request.Builder().url(urlBuilder.build()).post(body).build();
     return executeRequest(request, responseType);
   }
@@ -230,36 +230,7 @@ public class TonCenterV3 {
   private <T> T executeRequest(Request request, Type responseType) {
     try (Response response = httpClient.newCall(request).execute()) {
       String responseBody = response.body().string();
-
-      if (!response.isSuccessful()) {
-        try {
-          Type errorResponseType = new TypeToken<Map<String, Object>>() {}.getType();
-          Map<String, Object> errorResponse = gson.fromJson(responseBody, errorResponseType);
-
-          if (nonNull(errorResponse) && errorResponse.containsKey("error")) {
-            Integer errorCode =
-                errorResponse.containsKey("code")
-                    ? ((Number) errorResponse.get("code")).intValue()
-                    : response.code();
-            throw new TonCenterApiException(errorResponse.get("error").toString(), errorCode);
-          }
-        } catch (TonCenterApiException e) {
-          throw e;
-        } catch (Exception parseException) {
-          log.debug("Could not parse error response: {}", parseException.getMessage());
-        }
-
-        String errorMessage = "HTTP error: " + response.code();
-        if (nonNull(responseBody) && !responseBody.trim().isEmpty()) {
-          errorMessage += " - " + responseBody;
-        } else if (nonNull(response.message())) {
-          errorMessage += " " + response.message();
-        }
-        throw new TonCenterException(errorMessage);
-      }
-
-      return gson.fromJson(responseBody, responseType);
-
+      return parseResponse(response.code(), response.message(), responseBody, responseType);
     } catch (IOException e) {
       throw new TonCenterException("Network error: " + e.getMessage(), e);
     } catch (Exception e) {
@@ -267,6 +238,109 @@ public class TonCenterV3 {
         throw e;
       }
       throw new TonCenterException("Unexpected error: " + e.getMessage(), e);
+    }
+  }
+
+  private <T> T executeTransport(
+      String method,
+      String path,
+      Map<String, List<String>> query,
+      String body,
+      Type responseType) {
+    Map<String, String> headers = new LinkedHashMap<>();
+    if (nonNull(apiKey) && !apiKey.trim().isEmpty()) {
+      headers.put("X-API-Key", apiKey);
+    }
+    if (nonNull(body)) {
+      headers.put("Content-Type", JSON.toString());
+    }
+
+    TonCenterV3TransportRequest request =
+        new TonCenterV3TransportRequest(network, method, path, query, headers, body);
+    try {
+      TonCenterV3TransportResponse response =
+          Objects.requireNonNull(transport.execute(request), "transport response");
+      return parseResponse(
+          response.getStatusCode(), response.getMessage(), response.getBody(), responseType);
+    } catch (IOException e) {
+      throw new TonCenterException("Transport error: " + e.getMessage(), e);
+    } catch (Exception e) {
+      if (e instanceof TonCenterException) {
+        throw e;
+      }
+      throw new TonCenterException("Unexpected transport error: " + e.getMessage(), e);
+    }
+  }
+
+  private <T> T parseResponse(
+      int statusCode, String statusMessage, String responseBody, Type responseType) {
+    if (statusCode < 200 || statusCode >= 300) {
+      try {
+        Type errorResponseType = new TypeToken<Map<String, Object>>() {}.getType();
+        Map<String, Object> errorResponse = gson.fromJson(responseBody, errorResponseType);
+
+        if (nonNull(errorResponse) && errorResponse.containsKey("error")) {
+          Integer errorCode =
+              errorResponse.containsKey("code")
+                  ? ((Number) errorResponse.get("code")).intValue()
+                  : statusCode;
+          throw new TonCenterApiException(errorResponse.get("error").toString(), errorCode);
+        }
+      } catch (TonCenterApiException e) {
+        throw e;
+      } catch (Exception parseException) {
+        log.debug("Could not parse error response: {}", parseException.getMessage());
+      }
+
+      String errorMessage = "Toncenter request failed: " + statusCode;
+      if (nonNull(responseBody) && !responseBody.trim().isEmpty()) {
+        errorMessage += " - " + responseBody;
+      } else if (nonNull(statusMessage) && !statusMessage.trim().isEmpty()) {
+        errorMessage += " " + statusMessage;
+      }
+      throw new TonCenterException(errorMessage);
+    }
+
+    return gson.fromJson(responseBody, responseType);
+  }
+
+  private Map<String, List<String>> toQuery(Map<String, Object> params) {
+    Map<String, List<String>> query = new LinkedHashMap<>();
+    if (nonNull(params)) {
+      for (Map.Entry<String, Object> entry : params.entrySet()) {
+        Object value = entry.getValue();
+        if (value instanceof List) {
+          List<String> values = new ArrayList<>();
+          for (Object item : (List<?>) value) {
+            if (nonNull(item)) {
+              values.add(item.toString());
+            }
+          }
+          query.put(entry.getKey(), values);
+        } else if (nonNull(value)) {
+          query.put(entry.getKey(), new ArrayList<>(Collections.singletonList(value.toString())));
+        }
+      }
+    }
+    return query;
+  }
+
+  private void addCommonQueryParameters(Map<String, List<String>> query) {
+    if (nonNull(apiKey) && !apiKey.trim().isEmpty()) {
+      query.put("api_key", new ArrayList<>(Collections.singletonList(apiKey)));
+    }
+    if (uniqueRequests) {
+      query.put(
+          "t", new ArrayList<>(Collections.singletonList(UUID.randomUUID().toString())));
+    }
+  }
+
+  private void addQueryParameters(
+      HttpUrl.Builder urlBuilder, Map<String, List<String>> query) {
+    for (Map.Entry<String, List<String>> entry : query.entrySet()) {
+      for (String value : entry.getValue()) {
+        urlBuilder.addQueryParameter(entry.getKey(), value);
+      }
     }
   }
 

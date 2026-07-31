@@ -138,7 +138,7 @@ public class Mnemonic {
         }
     }
 
-    static String[] DEFAULT_WORDLIST = {
+    public static String[] DEFAULT_WORDLIST = {
             "abandon",
             "ability",
             "able",

@@ -176,60 +176,22 @@ public interface Contract {
   }
 
   default long getSeqno() {
-
     if (this instanceof WalletV1R1) {
       throw new Error("Wallet V1R1 does not have seqno method");
     }
     TonProvider provider = getTonProvider();
-    if (provider instanceof TonCenter) {
-      try {
-        return ((TonCenter) provider).getSeqno(getAddress().toBounceable());
-      } catch (Throwable e) {
-        throw new Error(e);
-      }
+    if (provider == null) {
+      throw new Error("Provider not set");
     }
-    if (provider instanceof AdnlLiteClient) {
-      try {
-        return ((AdnlLiteClient) provider).getSeqno(getAddress());
-      } catch (Exception e) {
-        throw new Error(e);
-      }
-    }
-    if (provider instanceof Tonlib) {
-      return ((Tonlib) provider).getSeqno(getAddress());
-    }
-    throw new Error("Provider not set");
+    return provider.getSeqno(getAddress());
   }
 
   default boolean isDeployed() {
     TonProvider provider = getTonProvider();
-    if (provider instanceof TonCenter) {
-      try {
-        String state = ((TonCenter) provider).getState(getAddress().toBounceable());
-        return "active".equals(state);
-      } catch (Exception e) {
-        return false;
-      }
-    } else if (provider instanceof AdnlLiteClient) {
-      try {
-        return (((AdnlLiteClient) provider)
-                .getAccount(getAddress())
-                .getAccountStorage()
-                .getAccountState()
-            instanceof AccountStateActive);
-      } catch (Exception e) {
-        return false;
-      }
-    } else if (provider instanceof Tonlib) {
-      try {
-        return StringUtils.isNotEmpty(
-            ((Tonlib) provider).getRawAccountState(getAddress()).getCode());
-      } catch (Exception e) {
-        return false;
-      }
-    } else {
+    if (provider == null) {
       throw new Error("Provider not set");
     }
+    return provider.isDeployed(getAddress());
   }
 
   default SendResponse send(Message externalMessage) {

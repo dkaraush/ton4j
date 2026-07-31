@@ -7,11 +7,20 @@ import com.google.gson.GsonBuilder;
 import com.google.gson.reflect.TypeToken;
 import java.io.IOException;
 import java.lang.reflect.Type;
+import java.math.BigInteger;
 import java.time.Duration;
 import java.util.*;
 import java.util.concurrent.TimeUnit;
 import lombok.extern.slf4j.Slf4j;
 import okhttp3.*;
+import org.ton.ton4j.address.Address;
+import org.ton.ton4j.provider.SendResponse;
+import org.ton.ton4j.provider.TonProvider;
+import org.ton.ton4j.tlb.AccountStates;
+import org.ton.ton4j.tlb.CurrencyCollection;
+import org.ton.ton4j.tlb.Message;
+import org.ton.ton4j.tlb.Transaction;
+import org.ton.ton4j.utils.Utils;
 import org.ton.ton4j.toncenterv3.model.ResponseModels.*;
 
 /**
@@ -20,7 +29,7 @@ import org.ton.ton4j.toncenterv3.model.ResponseModels.*;
  * OkHttp's connection pooling.
  */
 @Slf4j
-public class TonCenterV3 {
+public class TonCenterV3 implements TonProvider {
 
   private static final MediaType JSON = MediaType.get("application/json; charset=utf-8");
 
@@ -32,6 +41,8 @@ public class TonCenterV3 {
   private Duration writeTimeout;
   private boolean debug;
   private boolean uniqueRequests;
+  private Duration confirmationTimeout;
+  private Duration confirmationPollInterval;
   private TonCenterV3Transport transport;
   private OkHttpClient httpClient;
   private Gson gson;
@@ -48,6 +59,8 @@ public class TonCenterV3 {
     private Duration writeTimeout = Duration.ofSeconds(30);
     private boolean debug;
     private boolean uniqueRequests;
+    private Duration confirmationTimeout = Duration.ofSeconds(60);
+    private Duration confirmationPollInterval = Duration.ofSeconds(1);
     private TonCenterV3Transport transport;
 
     public TonCenterV3Builder apiKey(String apiKey) {
@@ -107,6 +120,25 @@ public class TonCenterV3 {
       return this;
     }
 
+    public TonCenterV3Builder confirmationTimeout(Duration confirmationTimeout) {
+      this.confirmationTimeout = requirePositive(confirmationTimeout, "confirmationTimeout");
+      return this;
+    }
+
+    public TonCenterV3Builder confirmationPollInterval(Duration confirmationPollInterval) {
+      this.confirmationPollInterval =
+          requirePositive(confirmationPollInterval, "confirmationPollInterval");
+      return this;
+    }
+
+    private static Duration requirePositive(Duration duration, String name) {
+      Objects.requireNonNull(duration, name);
+      if (duration.isZero() || duration.isNegative()) {
+        throw new IllegalArgumentException(name + " must be positive");
+      }
+      return duration;
+    }
+
     /**
      * Routes every Toncenter request through a protocol-neutral application transport instead of
      * OkHttp.
@@ -127,6 +159,8 @@ public class TonCenterV3 {
       tonCenterV3.network = this.network;
       tonCenterV3.debug = this.debug;
       tonCenterV3.uniqueRequests = this.uniqueRequests;
+      tonCenterV3.confirmationTimeout = this.confirmationTimeout;
+      tonCenterV3.confirmationPollInterval = this.confirmationPollInterval;
       tonCenterV3.transport = this.transport;
       tonCenterV3.connectTimeout = this.connectTimeout;
       tonCenterV3.readTimeout = this.readTimeout;
@@ -585,6 +619,16 @@ public class TonCenterV3 {
     return executeGet("/transactions", params, responseType);
   }
 
+  public TransactionsResponse getPendingTransactions(
+      List<String> account, List<String> traceId) {
+    Map<String, Object> params = new HashMap<>();
+    if (nonNull(account)) params.put("account", account);
+    if (nonNull(traceId)) params.put("trace_id", traceId);
+
+    Type responseType = new TypeToken<TransactionsResponse>() {}.getType();
+    return executeGet("/pendingTransactions", params, responseType);
+  }
+
   public MessagesResponse getMessages(
       List<String> msgHash,
       String bodyHash,
@@ -957,6 +1001,338 @@ public class TonCenterV3 {
   public Map<String, Object> runGetMethod(V2RunGetMethodRequest request) {
     Type responseType = new TypeToken<Map<String, Object>>() {}.getType();
     return executePost("/runGetMethod", request, responseType);
+  }
+
+  public V2RunGetMethodResult runGetMethodResult(V2RunGetMethodRequest request) {
+    Type responseType = new TypeToken<V2RunGetMethodResult>() {}.getType();
+    return executePost("/runGetMethod", request, responseType);
+  }
+
+  // ========== TON PROVIDER ==========
+
+  @Override
+  public BigInteger getBalance(Address address) {
+    AccountStatesResponse response =
+        getAccountStates(Collections.singletonList(address.toRaw()), false);
+    if (response == null
+        || response.getAccounts() == null
+        || response.getAccounts().isEmpty()
+        || response.getAccounts().get(0).getBalance() == null) {
+      return BigInteger.ZERO;
+    }
+    return parseDecimal(response.getAccounts().get(0).getBalance());
+  }
+
+  @Override
+  public long getSeqno(Address address) {
+    return runGetNumber(address, "seqno").longValue();
+  }
+
+  @Override
+  public BigInteger getPublicKey(Address address) {
+    return runGetNumber(address, "get_public_key");
+  }
+
+  @Override
+  public long getSubWalletId(Address address) {
+    return runGetNumber(address, "get_subwallet_id").longValue();
+  }
+
+  @Override
+  public boolean isDeployed(Address address) {
+    AccountStatesResponse response =
+        getAccountStates(Collections.singletonList(address.toRaw()), false);
+    return response != null
+        && response.getAccounts() != null
+        && !response.getAccounts().isEmpty()
+        && "active".equalsIgnoreCase(response.getAccounts().get(0).getStatus());
+  }
+
+  @Override
+  public void waitForDeployment(Address address, int timeoutSeconds) {
+    long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(timeoutSeconds);
+    while (System.nanoTime() < deadline) {
+      if (isDeployed(address)) {
+        return;
+      }
+      sleepForPolling();
+    }
+    throw new TonCenterException(
+        "Timeout waiting for deployment of " + address.toRaw());
+  }
+
+  @Override
+  public void waitForBalanceChange(Address address, int timeoutSeconds) {
+    BigInteger initialBalance = getBalance(address);
+    long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(timeoutSeconds);
+    while (System.nanoTime() < deadline) {
+      sleepForPolling();
+      if (!initialBalance.equals(getBalance(address))) {
+        return;
+      }
+    }
+    throw new TonCenterException(
+        "Timeout waiting for balance change of " + address.toRaw());
+  }
+
+  @Override
+  public void printAccountMessages(Address account) {
+    printAccountMessages(account, 20);
+  }
+
+  @Override
+  public void printAccountMessages(Address account, int historyLimit) {
+    TransactionsResponse response = getAccountTransactions(account, historyLimit);
+    if (response == null || response.getTransactions() == null) {
+      return;
+    }
+    for (org.ton.ton4j.toncenterv3.model.CommonModels.Transaction transaction
+        : response.getTransactions()) {
+      if (transaction.getInMsg() != null) {
+        log.info("in-message {}", transaction.getInMsg());
+      }
+      if (transaction.getOutMsgs() != null) {
+        for (org.ton.ton4j.toncenterv3.model.CommonModels.Message message
+            : transaction.getOutMsgs()) {
+          log.info("out-message {}", message);
+        }
+      }
+    }
+  }
+
+  @Override
+  public void printAccountTransactions(Address account) {
+    printAccountTransactions(account, 20, false);
+  }
+
+  @Override
+  public void printAccountTransactions(Address account, int historyLimit) {
+    printAccountTransactions(account, historyLimit, false);
+  }
+
+  @Override
+  public void printAccountTransactions(
+      Address account, int historyLimit, boolean withMessages) {
+    TransactionsResponse response = getAccountTransactions(account, historyLimit);
+    if (response == null || response.getTransactions() == null) {
+      return;
+    }
+    for (org.ton.ton4j.toncenterv3.model.CommonModels.Transaction transaction
+        : response.getTransactions()) {
+      log.info("transaction {}", transaction);
+      if (withMessages) {
+        if (transaction.getInMsg() != null) {
+          log.info("in-message {}", transaction.getInMsg());
+        }
+        if (transaction.getOutMsgs() != null) {
+          for (org.ton.ton4j.toncenterv3.model.CommonModels.Message message
+              : transaction.getOutMsgs()) {
+            log.info("out-message {}", message);
+          }
+        }
+      }
+    }
+  }
+
+  @Override
+  public Transaction sendExternalMessageWithConfirmation(Message externalMessage) {
+    return toTlbTransaction(sendExternalMessageWithConfirmationV3(externalMessage));
+  }
+
+  /**
+   * Sends an external message and returns Toncenter's complete indexed V3 transaction model after
+   * it appears in the index.
+   *
+   * <p>The {@link TonProvider} compatibility method converts this response to the legacy TLB
+   * transaction type, which cannot carry every indexed V3 field.
+   */
+  public org.ton.ton4j.toncenterv3.model.CommonModels.Transaction
+      sendExternalMessageWithConfirmationV3(Message externalMessage) {
+    V2SendMessageResult sent = submitExternalMessage(externalMessage);
+    String messageHash =
+        nonNull(sent.getMessageHashNorm()) ? sent.getMessageHashNorm() : sent.getMessageHash();
+    if (messageHash == null || messageHash.isEmpty()) {
+      throw new TonCenterException("Toncenter V3 returned an empty message hash");
+    }
+
+    long deadline = System.nanoTime() + confirmationTimeout.toNanos();
+    TonCenterException lastError = null;
+    while (System.nanoTime() < deadline) {
+      try {
+        TransactionsResponse response =
+            getTransactionsByMessage(messageHash, null, null, null, 1, 0);
+        if (response != null
+            && response.getTransactions() != null
+            && !response.getTransactions().isEmpty()) {
+          return response.getTransactions().get(0);
+        }
+      } catch (TonCenterException e) {
+        lastError = e;
+      }
+      sleepForPolling();
+    }
+    throw new TonCenterException(
+        "Timeout waiting for message " + messageHash,
+        lastError);
+  }
+
+  @Override
+  public SendResponse sendExternalMessage(Message externalMessage) {
+    try {
+      V2SendMessageResult result = submitExternalMessage(externalMessage);
+      String hash =
+          nonNull(result.getMessageHashNorm())
+              ? result.getMessageHashNorm()
+              : result.getMessageHash();
+      return SendResponse.builder().code(0).message(hash).build();
+    } catch (Exception e) {
+      return SendResponse.builder().code(1).message(e.getMessage()).build();
+    }
+  }
+
+  private V2SendMessageResult submitExternalMessage(Message externalMessage) {
+    if (externalMessage == null) {
+      throw new IllegalArgumentException("External message is null");
+    }
+    V2SendMessageRequest request = new V2SendMessageRequest();
+    request.setBoc(externalMessage.toCell().toBase64());
+    V2SendMessageResult result = sendMessage(request);
+    if (result == null) {
+      throw new TonCenterException("Toncenter V3 returned an empty send response");
+    }
+    return result;
+  }
+
+  private BigInteger runGetNumber(Address address, String method) {
+    V2RunGetMethodRequest request = new V2RunGetMethodRequest();
+    request.setAddress(address.toRaw());
+    request.setMethod(method);
+    request.setStack(Collections.emptyList());
+    V2RunGetMethodResult result = runGetMethodResult(request);
+    if (result == null || result.getExitCode() == null || result.getExitCode() != 0) {
+      throw new TonCenterException(
+          method
+              + " failed with exit code "
+              + (result == null ? "null" : result.getExitCode()));
+    }
+    if (result.getStack() == null
+        || result.getStack().isEmpty()
+        || result.getStack().get(0) == null) {
+      throw new TonCenterException(method + " returned an empty stack");
+    }
+    Object value = result.getStack().get(0).getValue();
+    if (value == null) {
+      throw new TonCenterException(method + " returned an empty value");
+    }
+    return parseNumber(value.toString());
+  }
+
+  private TransactionsResponse getAccountTransactions(Address account, int historyLimit) {
+    if (historyLimit < 1) {
+      throw new IllegalArgumentException("historyLimit must be positive");
+    }
+    return getTransactions(
+        null,
+        null,
+        null,
+        null,
+        Collections.singletonList(account.toRaw()),
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        Math.min(historyLimit, 1000),
+        0,
+        "desc");
+  }
+
+  private Transaction toTlbTransaction(
+      org.ton.ton4j.toncenterv3.model.CommonModels.Transaction transaction) {
+    Address account = Address.of(transaction.getAccount());
+    return Transaction.builder()
+        .magic(0b0111)
+        .accountAddr(new BigInteger(1, account.hashPart))
+        .lt(parseDecimal(transaction.getLt()))
+        .prevTxHash(parseHash(transaction.getPrevTransHash()))
+        .prevTxLt(parseDecimal(transaction.getPrevTransLt()))
+        .now(transaction.getNow() == null ? 0 : transaction.getNow())
+        .outMsgCount(
+            transaction.getOutMsgs() == null ? 0 : transaction.getOutMsgs().size())
+        .origStatus(parseAccountState(transaction.getOrigStatus()))
+        .endStatus(parseAccountState(transaction.getEndStatus()))
+        .totalFees(
+            CurrencyCollection.builder()
+                .coins(parseDecimal(transaction.getTotalFees()))
+                .build())
+        .build();
+  }
+
+  private AccountStates parseAccountState(String state) {
+    if ("active".equalsIgnoreCase(state)) {
+      return AccountStates.ACTIVE;
+    }
+    if ("frozen".equalsIgnoreCase(state)) {
+      return AccountStates.FROZEN;
+    }
+    if ("uninit".equalsIgnoreCase(state)
+        || "uninitialized".equalsIgnoreCase(state)) {
+      return AccountStates.UNINIT;
+    }
+    return AccountStates.NON_EXIST;
+  }
+
+  private BigInteger parseHash(String value) {
+    if (value == null || value.isEmpty()) {
+      return BigInteger.ZERO;
+    }
+    try {
+      String hex = value.startsWith("0x") || value.startsWith("0X")
+          ? value.substring(2)
+          : value;
+      if (hex.matches("[0-9a-fA-F]{64}")) {
+        return new BigInteger(hex, 16);
+      }
+      return new BigInteger(1, Utils.base64ToBytes(value));
+    } catch (Exception e) {
+      throw new TonCenterException("Invalid transaction hash: " + value, e);
+    }
+  }
+
+  private BigInteger parseDecimal(String value) {
+    if (value == null || value.isEmpty()) {
+      return BigInteger.ZERO;
+    }
+    try {
+      return new BigInteger(value);
+    } catch (NumberFormatException e) {
+      throw new TonCenterException("Invalid decimal value: " + value, e);
+    }
+  }
+
+  private BigInteger parseNumber(String value) {
+    try {
+      if (value.startsWith("-0x") || value.startsWith("-0X")) {
+        return new BigInteger(value.substring(3), 16).negate();
+      }
+      if (value.startsWith("0x") || value.startsWith("0X")) {
+        return new BigInteger(value.substring(2), 16);
+      }
+      return new BigInteger(value);
+    } catch (NumberFormatException e) {
+      throw new TonCenterException("Invalid stack number: " + value, e);
+    }
+  }
+
+  private void sleepForPolling() {
+    try {
+      Thread.sleep(Math.max(1, confirmationPollInterval.toMillis()));
+    } catch (InterruptedException e) {
+      Thread.currentThread().interrupt();
+      throw new TonCenterException("Interrupted while polling Toncenter V3", e);
+    }
   }
 
   // ========== UTILITY METHODS ==========

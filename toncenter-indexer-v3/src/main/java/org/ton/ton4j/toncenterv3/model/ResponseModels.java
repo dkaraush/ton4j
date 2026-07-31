@@ -1044,7 +1044,19 @@ public class ResponseModels {
         private String method;
         
         @SerializedName("stack")
-        private List<List<Object>> stack;
+        private List<V2StackEntity> stack;
+    }
+
+    @Data
+    public static class V2RunGetMethodResult {
+        @SerializedName("gas_used")
+        private Long gasUsed;
+
+        @SerializedName("exit_code")
+        private Integer exitCode;
+
+        @SerializedName("stack")
+        private List<V2StackEntity> stack;
     }
     
     @Data

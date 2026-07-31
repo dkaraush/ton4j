@@ -104,6 +104,20 @@ public class WalletV5 implements Contract {
     tonCenterClient = pTonCenterClient;
   }
 
+  @Override
+  public TonProvider getTonProvider() {
+    return tonProvider != null ? tonProvider : Contract.super.getTonProvider();
+  }
+
+  @Override
+  public void setTonProvider(TonProvider pTonProvider) {
+    tonProvider = pTonProvider;
+    tonCenterClient = pTonProvider instanceof TonCenter ? (TonCenter) pTonProvider : null;
+    adnlLiteClient =
+        pTonProvider instanceof AdnlLiteClient ? (AdnlLiteClient) pTonProvider : null;
+    tonlib = pTonProvider instanceof Tonlib ? (Tonlib) pTonProvider : null;
+  }
+
   private boolean deployAsLibrary;
 
   public static class WalletV5Builder {}
